@@ -1,7 +1,7 @@
 // The forge server: git smart HTTP, REST v3, GraphQL v4 and MCP on one in-memory store.
-// Only node:http and own files. Entry point contract: createApp() returns a Server.
+// Raw-socket transport (rawhttp.ts) plus own files. Entry point contract: createApp() returns a Server.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createRawServer, type RawRequest, type RawResponse } from './rawhttp.ts';
 import { handleInfoRefs, handleReceivePack, handleUploadPack } from './git.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
@@ -12,27 +12,32 @@ const MAX_BODY_BYTES = 32 * 1024 * 1024;
 
 const store = new Store();
 
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
+function sendJson(res: RawResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
   const text = `${JSON.stringify(body)}\n`;
   res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), 'x-github-request-id': store.nextReqId(), ...headers });
   res.end(text);
 }
 
-function sendBuffer(res: ServerResponse, status: number, contentType: string, body: Buffer, headers: Readonly<Record<string, string>> = {}): void {
+function sendBuffer(res: RawResponse, status: number, contentType: string, body: Buffer, headers: Readonly<Record<string, string>> = {}): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': body.length, 'x-github-request-id': store.nextReqId(), ...headers });
   res.end(body);
 }
 
-function sendEmpty(res: ServerResponse, status: number): void {
+function sendEmpty(res: RawResponse, status: number): void {
   res.writeHead(status, { 'x-github-request-id': store.nextReqId() });
   res.end();
 }
 
-function errJson(res: ServerResponse, status: number, message: string): void {
+function errJson(res: RawResponse, status: number, message: string): void {
   sendJson(res, status, { message });
 }
 
-function readBody(req: IncomingMessage): Promise<Buffer> {
+function readBody(req: RawRequest): Promise<Buffer> {
+  const pre = req.preRead;
+  if (pre !== null) {
+    if (pre.tooLarge) return Promise.reject(new Error('request body too large'));
+    return Promise.resolve(pre.body);
+  }
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -55,12 +60,12 @@ function parseJson(body: Buffer): { ok: true; value: unknown } | { ok: false } {
   }
 }
 
-function authed(req: IncomingMessage): boolean {
+function authed(req: RawRequest): boolean {
   const h = req.headers.authorization;
   return typeof h === 'string' && /^Bearer\s+\S+$/.test(h);
 }
 
-function parseUrl(req: IncomingMessage): { path: string; q: URLSearchParams } {
+function parseUrl(req: RawRequest): { path: string; q: URLSearchParams } {
   const raw = req.url ?? '/';
   // Fast path for origin-form URLs (everything the suite sends): split on '?' and '#' by hand
   // instead of building a URL object. Identical result for these inputs: URL keeps the raw
@@ -95,7 +100,7 @@ function pageParams(q: URLSearchParams): { page: number; perPage: number } {
   return { page, perPage };
 }
 
-function paginate<T>(req: IncomingMessage, path: string, q: URLSearchParams, items: T[]): { page: T[]; link: string | null } {
+function paginate<T>(req: RawRequest, path: string, q: URLSearchParams, items: T[]): { page: T[]; link: string | null } {
   const { page, perPage } = pageParams(q);
   const start = (page - 1) * perPage;
   const slice = items.slice(start, start + perPage);
@@ -110,7 +115,7 @@ function paginate<T>(req: IncomingMessage, path: string, q: URLSearchParams, ite
   return { page: slice, link };
 }
 
-function sendPage<T>(req: IncomingMessage, res: ServerResponse, path: string, q: URLSearchParams, items: T[]): void {
+function sendPage<T>(req: RawRequest, res: RawResponse, path: string, q: URLSearchParams, items: T[]): void {
   const { page, link } = paginate(req, path, q, items);
   sendJson(res, 200, page, link === null ? {} : { link });
 }
@@ -178,7 +183,7 @@ function pullJson(repo: Repo, pull: Pull): Record<string, unknown> {
   };
 }
 
-function getRepoOr404(res: ServerResponse, owner: string, name: string): Repo | null {
+function getRepoOr404(res: RawResponse, owner: string, name: string): Repo | null {
   const repo = store.getRepo(owner, name);
   if (!repo) { errJson(res, 404, 'Not Found'); return null; }
   return repo;
@@ -201,7 +206,7 @@ function contentsFileJson(repo: Repo, path: string, blobSha: string, data: Buffe
 
 // -------------------------------------------------------------------------------- REST handlers
 
-async function handleRest(req: IncomingMessage, res: ServerResponse, method: string, path: string, q: URLSearchParams): Promise<void> {
+async function handleRest(req: RawRequest, res: RawResponse, method: string, path: string, q: URLSearchParams): Promise<void> {
   const seg = segments(path);
   // seg[0] === 'api', seg[1] === 'v3'
   const rest = seg.slice(2);
@@ -550,9 +555,9 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
 // -------------------------------------------------------------------------------- server
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
-export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async () => {
+export function createApp(): ReturnType<typeof createRawServer> {
+  return createRawServer((req: RawRequest, res: RawResponse) => {
+    return (async () => {
       try {
         const method = req.method ?? 'GET';
         const { path, q } = parseUrl(req);
