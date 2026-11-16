@@ -378,6 +378,7 @@ class Executor {
       const issue: Issue = {
         id: this.store.nextId(), number: repo.nextNumber++, title: String(input.title ?? ''), body: String(input.body ?? ''),
         state: 'open', labels: [], seq: repo.issues.length + 1, comments: [],
+        nodeId: gid('Issue', `${repo.fullName}#${repo.nextNumber - 1}`),
       };
       repo.issues.push(issue);
       return this.select({ __kind: 'Issue', repo, issue }, field.children, vars, 'createIssue');
@@ -403,6 +404,7 @@ class Executor {
         id: this.store.nextId(), number: repo.nextNumber++, title: String(input.title ?? ''), body: String(input.body ?? ''),
         state: 'open', merged: false, merged_at: null, merge_commit_sha: null,
         headRef, headSha, baseRef, baseSha, seq: repo.pulls.length + 1,
+        nodeId: gid('PullRequest', `${repo.fullName}#${repo.nextNumber - 1}`),
       };
       repo.pulls.push(pull);
       return this.select({ __kind: 'PullRequest', repo, pull }, field.children, vars, 'createPullRequest');
@@ -503,7 +505,7 @@ class Executor {
       case 'Repository': {
         const repo = value.repo;
         switch (field.name) {
-          case 'id': return gid('Repository', repo.fullName);
+          case 'id': return repo.nodeId;
           case 'databaseId': return repo.id;
           case 'name': return repo.name;
           case 'nameWithOwner': return repo.fullName;
@@ -537,7 +539,7 @@ class Executor {
       case 'Issue': {
         const { repo, issue } = value;
         switch (field.name) {
-          case 'id': return gid('Issue', `${repo.fullName}#${issue.number}`);
+          case 'id': return issue.nodeId;
           case 'number': return issue.number;
           case 'title': return issue.title;
           case 'state': return issue.state === 'open' ? 'OPEN' : 'CLOSED';
@@ -553,7 +555,7 @@ class Executor {
       case 'PullRequest': {
         const { repo, pull } = value;
         switch (field.name) {
-          case 'id': return gid('PullRequest', `${repo.fullName}#${pull.number}`);
+          case 'id': return pull.nodeId;
           case 'number': return pull.number;
           case 'title': return pull.title;
           case 'body': return pull.body;

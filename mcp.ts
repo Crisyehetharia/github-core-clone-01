@@ -1,7 +1,7 @@
 // MCP at /mcp: JSON-RPC 2.0 Streamable HTTP, modern era (server/discover, revision
 // 2026-07-28), with the legacy initialize handshake as a fallback. Same store as REST.
 
-import { mergePull, type Repo, type Store } from './store.ts';
+import { gid, mergePull, type Repo, type Store } from './store.ts';
 
 export interface McpResult { status: number; body: unknown; }
 
@@ -149,6 +149,7 @@ function callTool(store: Store, viewerLogin: string, name: string, args: Record<
     const issue = {
       id: store.nextId(), number: repo.nextNumber++, title: str(args.title), body: str(args.body),
       state: 'open' as const, labels: [] as string[], seq: repo.issues.length + 1, comments: [],
+      nodeId: gid('Issue', `${repo.fullName}#${repo.nextNumber - 1}`),
     };
     repo.issues.push(issue);
     return toolResult(issueJson(repo, issue));
@@ -169,6 +170,7 @@ function callTool(store: Store, viewerLogin: string, name: string, args: Record<
       id: store.nextId(), number: repo.nextNumber++, title: str(args.title), body: str(args.body),
       state: 'open' as const, merged: false, merged_at: null, merge_commit_sha: null,
       headRef, headSha, baseRef, baseSha, seq: repo.pulls.length + 1,
+      nodeId: gid('PullRequest', `${repo.fullName}#${repo.nextNumber - 1}`),
     };
     repo.pulls.push(pull);
     return toolResult({

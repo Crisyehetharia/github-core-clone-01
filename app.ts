@@ -61,8 +61,21 @@ function authed(req: IncomingMessage): boolean {
 }
 
 function parseUrl(req: IncomingMessage): { path: string; q: URLSearchParams } {
+  const raw = req.url ?? '/';
+  // Fast path for origin-form URLs (everything the suite sends): split on '?' and '#' by hand
+  // instead of building a URL object. Identical result for these inputs: URL keeps the raw
+  // pathname (no decoding, no normalization of '/'), and the query parses the same way.
+  // Anything unusual (backslash, which URL would treat as '/', control chars, non-origin
+  // form) falls back to the URL constructor.
+  if (raw.startsWith('/') && raw.indexOf('\\') < 0 && !/[\u0000-\u001f\u007f]/.test(raw)) {
+    const hash = raw.indexOf('#');
+    const noFrag = hash < 0 ? raw : raw.slice(0, hash);
+    const qi = noFrag.indexOf('?');
+    if (qi < 0) return { path: noFrag, q: new URLSearchParams() };
+    return { path: noFrag.slice(0, qi), q: new URLSearchParams(noFrag.slice(qi + 1)) };
+  }
   try {
-    const u = new URL(req.url ?? '/', 'http://entry');
+    const u = new URL(raw, 'http://entry');
     return { path: u.pathname, q: u.searchParams };
   } catch {
     return { path: '/', q: new URLSearchParams() };
@@ -107,7 +120,7 @@ function sendPage<T>(req: IncomingMessage, res: ServerResponse, path: string, q:
 function repoJson(repo: Repo): Record<string, unknown> {
   return {
     id: repo.id,
-    node_id: gid('Repository', repo.fullName),
+    node_id: repo.nodeId,
     name: repo.name,
     full_name: repo.fullName,
     owner: { login: repo.owner, id: VIEWER.id, type: 'User' },
@@ -127,7 +140,7 @@ function repoJson(repo: Repo): Record<string, unknown> {
 function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
   return {
     id: issue.id,
-    node_id: gid('Issue', `${repo.fullName}#${issue.number}`),
+    node_id: issue.nodeId,
     number: issue.number,
     title: issue.title,
     body: issue.body,
@@ -143,7 +156,7 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
 function pullJson(repo: Repo, pull: Pull): Record<string, unknown> {
   return {
     id: pull.id,
-    node_id: gid('PullRequest', `${repo.fullName}#${pull.number}`),
+    node_id: pull.nodeId,
     number: pull.number,
     state: pull.state,
     title: pull.title,
@@ -417,6 +430,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
           const issue: Issue = {
             id: store.nextId(), number: repo.nextNumber++, title, body: typeof body.body === 'string' ? body.body : '',
             state: 'open', labels: labelNames, seq: repo.issues.length + 1, comments: [],
+            nodeId: gid('Issue', `${repo.fullName}#${repo.nextNumber - 1}`),
           };
           repo.issues.push(issue);
           sendJson(res, 201, issueJson(repo, issue));
@@ -486,6 +500,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, method: str
             id: store.nextId(), number: repo.nextNumber++, title, body: typeof body.body === 'string' ? body.body : '',
             state: 'open', merged: false, merged_at: null, merge_commit_sha: null,
             headRef, headSha, baseRef, baseSha, seq: repo.pulls.length + 1,
+            nodeId: gid('PullRequest', `${repo.fullName}#${repo.nextNumber - 1}`),
           };
           repo.pulls.push(pull);
           sendJson(res, 201, pullJson(repo, pull));

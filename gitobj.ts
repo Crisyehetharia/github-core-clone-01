@@ -24,6 +24,8 @@ export function hashObject(type: ObjType, data: Buffer): string {
 export interface TreeEntry { mode: string; name: string; oid: string; }
 
 export function parseTree(data: Buffer): TreeEntry[] {
+  const hit = treeCache.get(data);
+  if (hit !== undefined) return hit;
   const entries: TreeEntry[] = [];
   let off = 0;
   while (off < data.length) {
@@ -33,8 +35,17 @@ export function parseTree(data: Buffer): TreeEntry[] {
     entries.push({ mode: data.subarray(off, sp).toString('ascii'), name: data.subarray(sp + 1, nul).toString('utf8'), oid: data.subarray(nul + 1, nul + 21).toString('hex') });
     off = nul + 21;
   }
+  treeCache.set(data, entries);
   return entries;
 }
+
+// Parsed views are cached per object buffer: objects in the store are immutable and every
+// caller reads the parsed view without mutating it, so a parse done once (per buffer) serves
+// every later walk (reachability, flat trees, ancestry). WeakMap lets a buffer's entry die
+// with it; a freshly inflated copy parses once and is then the stored instance.
+const treeCache = new WeakMap<Buffer, TreeEntry[]>();
+const commitCache = new WeakMap<Buffer, CommitView>();
+const tagCache = new WeakMap<Buffer, TagView>();
 
 function compareTreeNames(a: { name: string; mode: string }, b: { name: string; mode: string }): number {
   const l = Buffer.from(a.mode === '40000' ? `${a.name}/` : a.name, 'utf8');
@@ -55,6 +66,8 @@ export function buildTree(entries: TreeEntry[]): Buffer {
 export interface CommitView { tree: string; parents: string[]; author: string; committer: string; message: string; }
 
 export function parseCommit(data: Buffer): CommitView {
+  const hit = commitCache.get(data);
+  if (hit !== undefined) return hit;
   const blank = data.indexOf('\n\n');
   const headEnd = blank < 0 ? data.length : blank;
   const message = blank < 0 ? '' : data.subarray(blank + 2).toString('utf8');
@@ -67,12 +80,16 @@ export function parseCommit(data: Buffer): CommitView {
     if (k === 'tree') tree = v; else if (k === 'parent') parents.push(v);
     else if (k === 'author') author = v; else if (k === 'committer') committer = v;
   }
-  return { tree, parents, author, committer, message };
+  const view: CommitView = { tree, parents, author, committer, message };
+  commitCache.set(data, view);
+  return view;
 }
 
 export interface TagView { object: string; type: ObjType; tag: string; tagger: string; message: string; }
 
 export function parseTag(data: Buffer): TagView {
+  const hit = tagCache.get(data);
+  if (hit !== undefined) return hit;
   const blank = data.indexOf('\n\n');
   const headEnd = blank < 0 ? data.length : blank;
   const headers = new Map<string, string>();
@@ -83,11 +100,13 @@ export function parseTag(data: Buffer): TagView {
     headers.set(line.slice(0, sp), line.slice(sp + 1));
   }
   const type = headers.get('type') ?? '';
-  return {
+  const view: TagView = {
     object: headers.get('object') ?? '', type: (type === 'commit' || type === 'tree' || type === 'blob' || type === 'tag') ? type : 'commit',
     tag: headers.get('tag') ?? '', tagger: headers.get('tagger') ?? '',
     message: blank < 0 ? '' : data.subarray(blank + 2).toString('utf8'),
   };
+  tagCache.set(data, view);
+  return view;
 }
 
 /** Every object reachable from roots (commit -> tree+parents, tag -> target, tree -> entries). */
@@ -327,10 +346,10 @@ function writePackObjectHeader(type: ObjType, size: number): Buffer {
 
 /** Build a packfile from plain objects (no deltas), sorted by oid for determinism. */
 export function writePack(objects: Iterable<GitObject>): Buffer {
-  const list = [...objects].sort((a, b) => {
-    const ao = hashObject(a.type, a.data); const bo = hashObject(b.type, b.data);
-    return ao < bo ? -1 : ao > bo ? 1 : 0;
-  });
+  // Hash each object once up front: the old comparator re-hashed both sides on every
+  // comparison (O(n log n) hashes for n objects). Same order, same bytes.
+  const list = [...objects].map((o) => ({ oid: hashObject(o.type, o.data), type: o.type, data: o.data }));
+  list.sort((a, b) => (a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0));
   const parts: Buffer[] = [];
   const header = Buffer.alloc(12);
   header.write('PACK', 0, 4, 'ascii');

@@ -7,11 +7,11 @@ export const VIEWER = { id: 1000, login: 'adaiversen', name: 'ada iversen', emai
 export const DEFAULT_BRANCH = 'main';
 
 export interface Comment { id: number; body: string; seq: number; }
-export interface Issue { id: number; number: number; title: string; body: string; state: 'open' | 'closed'; labels: string[]; seq: number; comments: Comment[]; }
+export interface Issue { id: number; number: number; title: string; body: string; state: 'open' | 'closed'; labels: string[]; seq: number; comments: Comment[]; nodeId: string; }
 export interface Pull {
   id: number; number: number; title: string; body: string;
   state: 'open' | 'closed'; merged: boolean; merged_at: string | null; merge_commit_sha: string | null;
-  headRef: string; headSha: string; baseRef: string; baseSha: string; seq: number;
+  headRef: string; headSha: string; baseRef: string; baseSha: string; seq: number; nodeId: string;
 }
 
 export interface Label { name: string; color: string; }
@@ -32,11 +32,14 @@ export class Repo {
   readonly pulls: Pull[] = [];
   nextNumber = 1;
   readonly createdSeq: number;
+  /** GraphQL node id: a pure function of the (immutable) full name, computed once. */
+  readonly nodeId: string;
 
   constructor(id: number, owner: string, name: string, isPrivate: boolean, description: string) {
     this.id = id; this.owner = owner; this.name = name;
     this.isPrivate = isPrivate; this.description = description;
     this.createdSeq = globalSeq++;
+    this.nodeId = gid('Repository', `${owner}/${name}`);
   }
 
   get fullName(): string { return `${this.owner}/${this.name}`; }
