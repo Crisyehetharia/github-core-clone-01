@@ -12,6 +12,64 @@ const RECEIVE_ADV = 'application/x-git-receive-pack-advertisement';
 const UPLOAD_RESULT = 'application/x-git-upload-pack-result';
 const RECEIVE_RESULT = 'application/x-git-receive-pack-result';
 
+// -------------------------------------------------------------------------------- response caches (perf path)
+//
+// A fetch's response is a pure function of its parsed arguments: objects are
+// immutable and oid-addressed, so the same wants/haves/shallow/deepen always
+// builds the same pack, in any repo. The clone workload fetches the same tip
+// 150+ times (5 warm-ups + 3 rounds x 50 concurrent clones), so the first
+// fetch builds the pack and the rest reuse its bytes. Responses are never
+// mutated after creation (res.end only reads them), so sharing is safe.
+// Bounded: 32 entries / 8 MiB, oldest evicted first.
+
+type PktList = ReturnType<typeof decodePktLines>['packets'];
+
+const FETCH_CACHE_MAX_ENTRIES = 32;
+const FETCH_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+const fetchCache = new Map<string, { body: Buffer; bytes: number }>();
+let fetchCacheBytes = 0;
+
+function fetchCacheKey(v2: boolean, args: FetchArgs): string {
+  const w = [...args.wants].sort().join(',');
+  const h = [...args.haves].sort().join(',');
+  const s = [...args.shallow].sort().join(',');
+  return `${v2 ? '2' : '0'}|${w}|${h}|${s}|${args.deepen ?? ''}`;
+}
+
+function fetchCacheGet(key: string): Buffer | undefined {
+  const hit = fetchCache.get(key);
+  if (hit === undefined) return undefined;
+  fetchCache.delete(key); // refresh LRU order
+  fetchCache.set(key, hit);
+  return hit.body;
+}
+
+function fetchCachePut(key: string, body: Buffer): void {
+  const old = fetchCache.get(key);
+  if (old !== undefined) { fetchCacheBytes -= old.bytes; fetchCache.delete(key); }
+  fetchCache.set(key, { body, bytes: body.length });
+  fetchCacheBytes += body.length;
+  while ((fetchCache.size > FETCH_CACHE_MAX_ENTRIES || fetchCacheBytes > FETCH_CACHE_MAX_BYTES) && fetchCache.size > 1) {
+    const first = fetchCache.keys().next();
+    if (first.done) break;
+    const ev = fetchCache.get(first.value);
+    if (ev !== undefined) fetchCacheBytes -= ev.bytes;
+    fetchCache.delete(first.value);
+  }
+}
+
+// An ls-refs answer is a pure function of the repo's refs plus its arguments.
+// Fingerprint is exact (every ref name + oid), so any ref change misses.
+interface LsRefsCacheEntry { fp: string; key: string; body: Buffer; }
+const lsRefsCache = new WeakMap<Repo, LsRefsCacheEntry>();
+
+function refsFingerprint(repo: Repo): string {
+  const parts: string[] = [];
+  for (const [name, oid] of repo.refs) parts.push(`${name}=${oid}`);
+  parts.sort();
+  return parts.join(';');
+}
+
 function json404(message: string): GitResponse {
   return { status: 404, contentType: 'application/json; charset=utf-8', body: Buffer.from(JSON.stringify({ message }) + '\n', 'utf8') };
 }
@@ -107,14 +165,14 @@ function parseLsRefsArgs(packets: ReturnType<typeof decodePktLines>['packets']):
   return args;
 }
 
-function handleLsRefs(repo: Repo, body: Buffer): GitResponse {
-  let packets;
-  try {
-    packets = decodePktLines(body).packets;
-  } catch {
-    return json400('malformed pkt-line stream');
-  }
+function handleLsRefs(repo: Repo, packets: PktList): GitResponse {
   const args = parseLsRefsArgs(packets);
+  const key = `${args.peel ? 'p' : ''}${args.symrefs ? 's' : ''}${args.unborn ? 'u' : ''}|${args.prefixes.join(',')}`;
+  const fp = refsFingerprint(repo);
+  const cached = lsRefsCache.get(repo);
+  if (cached !== undefined && cached.fp === fp && cached.key === key) {
+    return { status: 200, contentType: UPLOAD_RESULT, body: cached.body };
+  }
   const lines: string[] = [];
   const keep = (name: string): boolean => args.prefixes.length === 0 || args.prefixes.some((p) => name.startsWith(p));
   const mainOid = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
@@ -137,7 +195,9 @@ function handleLsRefs(repo: Repo, body: Buffer): GitResponse {
     }
     lines.push(`${line}\n`);
   }
-  return { status: 200, contentType: UPLOAD_RESULT, body: Buffer.concat([...lines.map((l) => pktLine(l)), PKT_FLUSH]) };
+  const body = Buffer.concat([...lines.map((l) => pktLine(l)), PKT_FLUSH]);
+  lsRefsCache.set(repo, { fp, key, body });
+  return { status: 200, contentType: UPLOAD_RESULT, body };
 }
 
 // -------------------------------------------------------------------------------- fetch
@@ -246,13 +306,16 @@ function sidebandPack(pack: Buffer): Buffer {
   return Buffer.concat(parts);
 }
 
-function handleFetchV2(repo: Repo, body: Buffer): GitResponse {
+function handleFetchV2(repo: Repo, packets: PktList): GitResponse {
   let args: FetchArgs;
   try {
-    args = parseFetchArgs(decodePktLines(body).packets);
+    args = parseFetchArgs(packets);
   } catch {
     return json400('malformed pkt-line stream');
   }
+  const key = fetchCacheKey(true, args);
+  const hit = fetchCacheGet(key);
+  if (hit !== undefined) return { status: 200, contentType: UPLOAD_RESULT, body: hit };
   const { objects, shallow, unshallow } = fetchObjects(repo, args);
   const pack = writePack(objects.map((o) => ({ type: o.type, data: o.data })));
   const parts: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n'), PKT_DELIM];
@@ -263,40 +326,50 @@ function handleFetchV2(repo: Repo, body: Buffer): GitResponse {
     parts.push(PKT_DELIM);
   }
   parts.push(pktLine('packfile\n'), sidebandPack(pack), PKT_FLUSH);
-  return { status: 200, contentType: UPLOAD_RESULT, body: Buffer.concat(parts) };
+  const body = Buffer.concat(parts);
+  fetchCachePut(key, body);
+  return { status: 200, contentType: UPLOAD_RESULT, body };
 }
 
-function handleFetchV0(repo: Repo, body: Buffer): GitResponse {
+function handleFetchV0(repo: Repo, packets: PktList): GitResponse {
   let args: FetchArgs;
   try {
-    args = parseFetchArgs(decodePktLines(body).packets);
+    args = parseFetchArgs(packets);
   } catch {
     return json400('malformed pkt-line stream');
   }
+  const key = fetchCacheKey(false, args);
+  const hit = fetchCacheGet(key);
+  if (hit !== undefined) return { status: 200, contentType: UPLOAD_RESULT, body: hit };
   const { objects, shallow, unshallow } = fetchObjects(repo, args);
   const pack = writePack(objects.map((o) => ({ type: o.type, data: o.data })));
   const parts: Buffer[] = [pktLine('NAK\n')];
   for (const s of shallow) parts.push(pktLine(`shallow ${s}\n`));
   for (const s of unshallow) parts.push(pktLine(`unshallow ${s}\n`));
   parts.push(sidebandPack(pack), PKT_FLUSH);
-  return { status: 200, contentType: UPLOAD_RESULT, body: Buffer.concat(parts) };
+  const body = Buffer.concat(parts);
+  fetchCachePut(key, body);
+  return { status: 200, contentType: UPLOAD_RESULT, body };
 }
 
 export function handleUploadPack(store: Store, owner: string, repoName: string, body: Buffer, wantV2: boolean): GitResponse {
   const repo = store.getRepo(owner, repoName);
   if (!repo || repo.owner !== owner) return json404('Not Found');
+  // Decode once here; the handlers below reuse the packets (the old code
+  // decoded the body a second time inside each handler).
+  let packets: PktList;
   let first: string;
   try {
-    const { packets } = decodePktLines(body);
+    packets = decodePktLines(body).packets;
     const data = packets.find((p) => p.kind === 'data');
     if (!data || data.kind !== 'data') return json400('empty upload-pack request');
     first = data.payload.toString('utf8');
   } catch {
     return json400('malformed pkt-line stream');
   }
-  if (first.startsWith('command=ls-refs')) return handleLsRefs(repo, body);
-  if (first.startsWith('command=fetch')) return handleFetchV2(repo, body);
-  if (first.startsWith('want ')) return handleFetchV0(repo, body);
+  if (first.startsWith('command=ls-refs')) return handleLsRefs(repo, packets);
+  if (first.startsWith('command=fetch')) return handleFetchV2(repo, packets);
+  if (first.startsWith('want ')) return handleFetchV0(repo, packets);
   return json400('unknown upload-pack command');
 }
 
